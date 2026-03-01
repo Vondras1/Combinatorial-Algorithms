@@ -1,0 +1,1 @@
+/usr/bin/c++   -std=c++11 -O2 -march=native -pthread -g  -rdynamic CMakeFiles/example.dir/example.cpp.o  -o example  -L/home/modosist/opt/gurobi810/linux64/lib -Wl,-rpath,/home/modosist/opt/gurobi810/linux64/lib /home/modosist/opt/gurobi810/linux64/lib/libgurobi_c++.a -lgurobi81 
