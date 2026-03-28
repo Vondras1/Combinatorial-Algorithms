@@ -73,7 +73,7 @@ class Input:
         print(f"C = {self.C}")
         print("------------------------")
 
-def write_solution(filename, m, x, t, z, vehicles, nodes, customers):
+def write_solution(filename, m, x, t, z, vehicles, customers):
     if m.status != g.GRB.OPTIMAL:
         with open(filename, "w") as f:
             f.write("-1\n")
@@ -89,17 +89,24 @@ def write_solution(filename, m, x, t, z, vehicles, nodes, customers):
         for d in used_vehicles:
             route = []
             current = 0  # start at depot
+            visited = set()
 
             while True:
                 next_node = None
-                for v in nodes:
-                    if v != current and x[d, current, v].X > 0.5:
+                for v in [*customers, 0]:
+                    if v == current:
+                        continue
+                    if (d, current, v) in x and x[d, current, v].X > 0.5:
                         next_node = v
                         break
 
                 if next_node is None or next_node == 0:
                     break
 
+                if next_node in visited:
+                    raise RuntimeError(f"Cycle detected while writing route for vehicle {d}")
+
+                visited.add(next_node)
                 route.append(next_node)
                 current = next_node
 
@@ -208,20 +215,51 @@ def optimization_problem(path_input_file, path_output_file):
     # Create an empty model
     m = g.Model()
 
+    # ----------------------------------------
+    # Feasible arcs
+    # ----------------------------------------
+    customer_in_arcs = {i: [] for i in customers}
+    customer_out_arcs = {i: [] for i in customers}
+    depot_out_arcs = []
+    depot_in_arcs = []
+
+    arcs = []
+
+    # Depot -> customer
+    for v in customers:
+        if input.T[depot][v] <= input.T_out[v]:
+            arcs.append((depot, v))
+            depot_out_arcs.append((depot, v))
+            customer_in_arcs[v].append((depot, v))
+
+    # Customer -> depot
+    for u in customers:
+        arcs.append((u, depot))
+        depot_in_arcs.append((u, depot))
+        customer_out_arcs[u].append((u, depot))
+
+    # Customer -> customer
+    for u in customers:
+        for v in customers:
+            if u == v:
+                continue
+
+            # Even if we leave u at its earliest feasible time,
+            # can we still arrive to v before v closes?
+            if input.T_in[u] + input.T[u][v] <= input.T_out[v]:
+                arcs.append((u, v))
+                customer_out_arcs[u].append((u, v))
+                customer_in_arcs[v].append((u, v))
+
     # ---------------------------------------- 
     # Variables 
     # ----------------------------------------
     # x[d,u,v] = 1 if vehicle d goes directly from u to v (u != v)
     x = m.addVars(
-        vehicles, nodes, nodes,
+        [(d, u, v) for d in vehicles for (u, v) in arcs],
         vtype=g.GRB.BINARY,
         name="x"
     )
-
-    # Forbid self-loops: x[d,i,i] = 0
-    for d in vehicles:
-        for i in nodes:
-            x[d, i, i].ub = 0 # Set upper bound to be 0 (should be faster in comparison with constrain == 0)
 
     # y[d,i] = 1 if vehicle d serves customer i
     y = m.addVars(vehicles, customers, vtype=g.GRB.BINARY, name="y")
@@ -232,6 +270,9 @@ def optimization_problem(path_input_file, path_output_file):
     # t[d,i] arrival time of vehicle d to customer i
     # (We do not need depot time explicitly.)
     t = m.addVars(vehicles, customers, vtype=g.GRB.CONTINUOUS, lb=0.0, name="t") # lb - lower bound
+
+    # p[d,i] = order (time) of customer i on route of vehicle d
+    p = m.addVars(vehicles, customers, vtype=g.GRB.CONTINUOUS, lb=0.0, ub=N, name="p")
 
     # Big-M (constatnt)
     max_Tout = max(input.T_out) if N > 0 else 0.0
@@ -256,7 +297,7 @@ def optimization_problem(path_input_file, path_output_file):
     for d in vehicles:
         for i in customers:
             m.addConstr(
-                y[d, i] == g.quicksum(x[d, u, i] for u in nodes if u != i),
+                y[d, i] == g.quicksum(x[d, u, v] for (u, v) in customer_in_arcs[i]),
                 name=f"link_y_in_{d}_{i}"
             )
 
@@ -272,16 +313,17 @@ def optimization_problem(path_input_file, path_output_file):
     for d in vehicles:
         for i in customers:
             m.addConstr(
-                g.quicksum(x[d, u, i] for u in nodes if u != i) == g.quicksum(x[d, i, v] for v in nodes if v != i),
+                g.quicksum(x[d, u, v] for (u, v) in customer_in_arcs[i]) ==
+                g.quicksum(x[d, u, v] for (u, v) in customer_out_arcs[i]),
                 name=f"flow_{d}_{i}"
             )
 
     # (4) Leave depot at most once; and return if left.
     for d in vehicles:
-        leave = g.quicksum(x[d, depot, v] for v in customers)
-        ret = g.quicksum(x[d, u, depot] for u in customers)
+        leave = g.quicksum(x[d, u, v] for (u, v) in depot_out_arcs)
+        ret = g.quicksum(x[d, u, v] for (u, v) in depot_in_arcs)
 
-        # m.addConstr(leave <= 1, name=f"depot_leave_once_{d}") # Redundant since z is binary
+        # m.addConstr(leave <= 1, name=f"depot_leave_once_{d}")
         m.addConstr(ret == leave, name=f"depot_return_{d}")
 
         # Link z: if leaves then z=1
@@ -316,10 +358,8 @@ def optimization_problem(path_input_file, path_output_file):
     # (8) Time precedence along arcs between customers:
     # if x[d,u,v] = 1 then t[v] >= t[u] + T_uv
     for d in vehicles:
-        for u in customers:
-            for v in customers:
-                if u == v:
-                    continue
+        for (u, v) in arcs:
+            if u != depot and v != depot:
                 m.addConstr(
                     t[d, v] >= t[d, u] + input.T[u][v] - M * (1 - x[d, u, v]),
                     name=f"time_prec_{d}_{u}_{v}"
@@ -328,11 +368,26 @@ def optimization_problem(path_input_file, path_output_file):
     # (9) Depot -> first customer time feasibility:
     # if x[d,0,v]=1 then t[v] >= T_0v (depart at time 0)
     for d in vehicles:
-        for v in customers:
+        for (_, v) in depot_out_arcs:
             m.addConstr(
                 t[d, v] >= input.T[depot][v] - M * (1 - x[d, depot, v]),
                 name=f"time_from_depot_{d}_{v}"
             )
+
+    # (10) Stop subtours
+    # if x[d,0,v]=1 then p[d,v] >= p[d,u] + 1
+    for d in vehicles:
+        for i in customers:
+            m.addConstr(p[d, i] >= y[d, i], name=f"p_lb_{d}_{i}")
+            m.addConstr(p[d, i] <= N * y[d, i], name=f"p_ub_{d}_{i}")
+
+    for d in vehicles:
+        for (u, v) in arcs:
+            if u != depot and v != depot:
+                m.addConstr(
+                    p[d, v] >= p[d, u] + 1 - (N * (1 - x[d, u, v])),
+                    name=f"stop_subtours_{d}_{u}_{v}"
+                )
 
     # ---------------------------------------- 
     # Objective 
@@ -340,9 +395,7 @@ def optimization_problem(path_input_file, path_output_file):
     travel_cost = g.quicksum(
         input.C[u][v] * x[d, u, v]
         for d in vehicles
-        for u in nodes
-        for v in nodes
-        if u != v
+        for (u, v) in arcs
     )
     fixed_cost = input.Gamma * g.quicksum(z[d] for d in vehicles)
 
@@ -352,6 +405,9 @@ def optimization_problem(path_input_file, path_output_file):
     # Optimize 
     # ----------------------------------------
     m.optimize(subtour_elimination_callback)
+
+    # print("Status:", m.status)
+    # print("Objective value:", m.objVal)
     
     write_solution(
         path_output_file,
@@ -360,7 +416,6 @@ def optimization_problem(path_input_file, path_output_file):
         t,
         z,
         vehicles,
-        nodes,
         customers
     )
 

@@ -110,90 +110,6 @@ def write_solution(filename, m, x, t, z, vehicles, nodes, customers):
                 f.write(f" {customer} {arrival_time}")
             f.write("\n")
 
-def extract_graph_components(selected_arcs, customers):
-    """
-    selected_arcs: list of tuples (u, v) for one vehicle with x[d,u,v] = 1
-    Returns connected components among customer nodes only.
-    Depot 0 is ignored.
-    """
-    adjacency = {i: set() for i in customers}
-
-    for u, v in selected_arcs:
-        if u != 0 and v != 0:
-            adjacency[u].add(v)
-            adjacency[v].add(u)
-
-    visited = set()
-    components = []
-
-    for start in customers:
-        # if already visited, skip
-        if start in visited:
-            continue
-
-        # if it has no customer neighbors at all, skip
-        if len(adjacency[start]) == 0:
-            continue
-
-        stack = [start]
-        component = []
-        visited.add(start)
-
-        while stack:
-            node = stack.pop()
-            component.append(node)
-            for nei in adjacency[node]:
-                if nei not in visited:
-                    visited.add(nei)
-                    stack.append(nei)
-
-        components.append(component)
-
-    return components
-
-def subtour_elimination_callback(model, where):
-    if where != g.GRB.Callback.MIPSOL:
-        return
-
-    x = model._x
-    z = model._z
-    vehicles = model._vehicles
-    nodes = model._nodes
-    customers = model._customers
-
-    for d in vehicles:
-        # skip unused vehicles
-        if model.cbGetSolution(z[d]) < 0.5:
-            continue
-
-        # collect selected arcs
-        selected_arcs = []
-        for u in nodes:
-            for v in nodes:
-                if u != v and model.cbGetSolution(x[d, u, v]) > 0.5:
-                    selected_arcs.append((u, v))
-
-
-        components = extract_graph_components(selected_arcs, customers)
-
-        for comp in components:
-            # Check whether this component is disconnected from depot.
-            # If no arc connects depot <=> comp, then it is a forbidden subtour.
-            uses_depot = False
-            comp_set = set(comp)
-
-            for (u, v) in selected_arcs:
-                if (u == 0 and v in comp_set) or (v == 0 and u in comp_set):
-                    uses_depot = True
-                    break
-
-            if uses_depot:
-                continue
-
-            # Add lazy constraint: a subtour needs |S| internal arcs, but the constraint allows at most |S-1|, so the subtour cannot exist.
-            # sum_{u,v in comp, u!=v} x[d,u,v] <= |comp| - 1
-            model.cbLazy(g.quicksum(x[d, u, v] for u in comp for v in comp if u != v) <= len(comp) - 1)
-
 def optimization_problem(path_input_file, path_output_file):
     input = Input()
     input.decode_input(path_input_file)
@@ -233,20 +149,13 @@ def optimization_problem(path_input_file, path_output_file):
     # (We do not need depot time explicitly.)
     t = m.addVars(vehicles, customers, vtype=g.GRB.CONTINUOUS, lb=0.0, name="t") # lb - lower bound
 
+    # p[d,i] = order (time) of customer i on route of vehicle d
+    p = m.addVars(vehicles, customers, vtype=g.GRB.CONTINUOUS, lb=0.0, ub=N, name="p")
+
     # Big-M (constatnt)
     max_Tout = max(input.T_out) if N > 0 else 0.0
     max_travel = max(max(row) for row in input.T) if N >= 0 else 0.0
     M = max_Tout + max_travel + 1.0  # +1 as a small cushion
-
-    # ---------------------------------------- 
-    # Allow lazy constrains + callback variables
-    # ---------------------------------------- 
-    m.Params.LazyConstraints = 1
-    m._x = x
-    m._z = z
-    m._vehicles = vehicles
-    m._nodes = nodes
-    m._customers = customers
 
     # ---------------------------------------- 
     # Constraints 
@@ -281,15 +190,15 @@ def optimization_problem(path_input_file, path_output_file):
         leave = g.quicksum(x[d, depot, v] for v in customers)
         ret = g.quicksum(x[d, u, depot] for u in customers)
 
-        # m.addConstr(leave <= 1, name=f"depot_leave_once_{d}") # Redundant since z is binary
+        m.addConstr(leave <= 1, name=f"depot_leave_once_{d}")
         m.addConstr(ret == leave, name=f"depot_return_{d}")
 
         # Link z: if leaves then z=1
         m.addConstr(leave == z[d], name=f"link_z_{d}")
 
-    # (5) Symmetry breaking: use lower-indexed vehicles first 3 To make the program faster
-    for d in range(K - 1):
-        m.addConstr(z[d] >= z[d + 1], name=f"symmetry_use_order_{d}")
+    # (5) Vehicle count limit: sum_d z[d] <= K
+    # (This is redundant since I have exactly K vehicles, but keeps intent explicit (at least for now).) # FIXME
+    m.addConstr(g.quicksum(z[d] for d in vehicles) <= input.K, name="vehicle_limit")
 
     # (6) Capacity per vehicle: sum_i s_i * y[d,i] <= Q
     for d in vehicles:
@@ -334,6 +243,23 @@ def optimization_problem(path_input_file, path_output_file):
                 name=f"time_from_depot_{d}_{v}"
             )
 
+    # (10) Stop subtours
+    # if x[d,0,v]=1 then p[d,v] >= p[d,u] + 1
+    for d in vehicles:
+        for i in customers:
+            m.addConstr(p[d, i] >= y[d, i], name=f"p_lb_{d}_{i}")
+            m.addConstr(p[d, i] <= N * y[d, i], name=f"p_ub_{d}_{i}")
+
+    for d in vehicles:
+        for u in customers:
+            for v in customers:
+                if u == v:
+                    continue
+                m.addConstr(
+                    p[d, v] >= p[d, u] + 1 - (N * (1 - x[d, u, v])),
+                    name=f"stop_subtours_{d}_{u}_{v}"
+                )
+
     # ---------------------------------------- 
     # Objective 
     # ----------------------------------------
@@ -351,7 +277,10 @@ def optimization_problem(path_input_file, path_output_file):
     # ---------------------------------------- 
     # Optimize 
     # ----------------------------------------
-    m.optimize(subtour_elimination_callback)
+    m.optimize()
+
+    # print("Status:", m.status)
+    # print("Objective value:", m.objVal)
     
     write_solution(
         path_output_file,
