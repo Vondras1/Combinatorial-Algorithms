@@ -197,10 +197,6 @@ def optimization_problem(path_input_file, path_output_file):
             g.quicksum(x[d, i, j] for d in vehicles for i in nodes if i != j) == 1,
             name=f"entre_once_{j}"
         )
-        m.addConstr(
-            g.quicksum(x[d, j, i] for d in vehicles for i in nodes if i != j) == 1,
-            name=f"leave_once_{j}"
-        )
 
     # 2) If van d arrived to i, it also has to leave it (Flow conservation per vehicle at each customer):
     # sum_u x[d,u,i] == sum_v x[d,i,v]
@@ -252,12 +248,11 @@ def optimization_problem(path_input_file, path_output_file):
                         t[d,u] + inp.T[u,v] <= t[d,v] + M*(1-x[d,u,v]),
                         name=f"time_arc_{d}_{u}_{v}"
                     )
-    # 6.2) Time precedence between depot and first customers:
-    for d in vehicles:
-        for v in customers:
+            
+            # 6.2) Time precedence between depot and first customers:
             m.addConstr(
-                t[d, v] >= inp.T[depot, v] - M * (1 - x[d, depot, v]),
-                name=f"time_from_depot_{d}_{v}"
+                t[d, u] >= inp.T[depot, u] - M * (1 - x[d, depot, u]),
+                name=f"time_from_depot_{d}_{u}"
             )
 
     m.optimize()
