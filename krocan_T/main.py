@@ -175,6 +175,48 @@ def evaluate_solution(solution: Solution, inp: Input, stop_on_infeasible=False) 
         feasible=feasible,
     )
 
+def evaluate_neighbor_from_changed_routes(
+    current_eval: SolutionEvaluation,
+    neighbor: Solution,
+    changed_route_indices: set[int],
+    inp: Input,
+) -> SolutionEvaluation:
+    new_route_evals = current_eval.routes.copy()
+    new_total_travel_cost = current_eval.total_travel_cost
+    feasible = True
+
+    # Re-evaluate only changed routes
+    for route_idx in changed_route_indices:
+        if route_idx >= len(neighbor):
+            continue
+
+        old_eval = current_eval.routes[route_idx]
+        new_eval = evaluate_route(neighbor[route_idx], inp, stop_on_infeasible=True)
+
+        new_route_evals[route_idx] = new_eval
+        new_total_travel_cost += new_eval.travel_cost - old_eval.travel_cost
+
+        if not new_eval.feasible:
+            feasible = False
+
+    # If some unchanged old route was already infeasible, keep infeasible state
+    if current_eval.feasible is False:
+        for i, route_eval in enumerate(new_route_evals):
+            if i not in changed_route_indices and not route_eval.feasible:
+                feasible = False
+                break
+
+    used_vans = len(neighbor)
+    objective = new_total_travel_cost + inp.Gamma * used_vans
+
+    return SolutionEvaluation(
+        routes=new_route_evals,
+        total_travel_cost=new_total_travel_cost,
+        used_vans=used_vans,
+        objective=objective,
+        feasible=feasible,
+    )
+
 
 # ------------------------------------------------------------------
 # Try to solve it
@@ -218,7 +260,7 @@ def generate_relocate_neighbors(solution: Solution, rng: random.Random):
                     customer = new_solution[from_route_idx].pop(customer_idx)
                     new_solution[to_route_idx].insert(insert_pos, customer)
 
-                    yield filter_solution(new_solution)
+                    yield new_solution, {from_route_idx, to_route_idx}
 
 # Take one customer from one route and exchange it with one customer from another route.
 def generate_swap_neighbors(solution: Solution, rng: random.Random):
@@ -243,7 +285,7 @@ def generate_swap_neighbors(solution: Solution, rng: random.Random):
                     new_solution[route1_idx][idx1], new_solution[route2_idx][idx2] = \
                         new_solution[route2_idx][idx2], new_solution[route1_idx][idx1]
 
-                    yield filter_solution(new_solution)
+                    yield new_solution, {route1_idx, route2_idx}
 
 def generate_tail_swap_neighbors(solution: Solution, rng: random.Random):
     route1_indices = list(range(len(solution)))
@@ -280,62 +322,157 @@ def generate_tail_swap_neighbors(solution: Solution, rng: random.Random):
                     new_solution[route1_idx] = prefix1 + suffix2
                     new_solution[route2_idx] = prefix2 + suffix1
 
-                    yield filter_solution(new_solution)
-
+                    yield new_solution, {route1_idx, route2_idx}
 
 def generate_all_neighbors(solution: Solution, rng: random.Random):
-    if rng.random() < 0.5:
-        print(":-}{")
+    rng_number = rng.random()
+    if rng_number < 0.5:
+        # print(":-}{")
         yield from generate_relocate_neighbors(solution, rng)
         yield from generate_swap_neighbors(solution, rng)
+        yield from generate_tail_swap_neighbors(solution, rng)
     else:
-        print(":-}")
+        # print(":-}")
         yield from generate_swap_neighbors(solution, rng)
         yield from generate_relocate_neighbors(solution, rng)
-    print("DONE")
+        yield from generate_tail_swap_neighbors(solution, rng)
     # yield from generate_tail_swap_neighbors(solution, rng)
 
-
-# def find_best_neighbor(solution: Solution, inp: Input):
-#     best_solution = filter_solution(copy_solution(solution))
-#     best_eval = evaluate_solution(best_solution, inp)
-
-#     for neighbor in generate_all_neighbors(best_solution):
-#         neighbor_eval = evaluate_solution(neighbor, inp)
-
-#         if not neighbor_eval.feasible:
-#             continue
-
-#         if (not best_eval.feasible) or (neighbor_eval.objective < best_eval.objective):
-#             best_solution = neighbor
-#             best_eval = neighbor_eval
-
-#     return best_solution, best_eval
-
 def find_first_improving_neighbor(solution: Solution, inp: Input, rng: random.Random, end_time: float):
-    current_solution = filter_solution(copy_solution(solution))
+    current_solution = copy_solution(solution)
     current_eval = evaluate_solution(current_solution, inp)
 
-    for neighbor in generate_all_neighbors(current_solution, rng):
+    for neighbor, changed_route_indices in generate_all_neighbors(current_solution, rng):
+        if time.time() >= end_time:
+            break
+
+        neighbor_eval = evaluate_neighbor_from_changed_routes(
+            current_eval,
+            neighbor,
+            changed_route_indices,
+            inp,
+        )
 
         if time.time() >= end_time:
             break
 
-        # FIXME - It is not neccessary to evaluate whole solution everytime
-        # as relocate and swap change only 2 routes, we can keep track of which routes are changed and re-evaluate only those
-        neighbor_eval = evaluate_solution(neighbor, inp, stop_on_infeasible=True) 
-
-        if time.time() >= end_time:
-            break
-        
         if not neighbor_eval.feasible:
             continue
 
         if neighbor_eval.objective < current_eval.objective:
-            return neighbor, neighbor_eval
-        
+            # Filter empty routes only after accepting the move.
+            neighbor = filter_solution(neighbor)
+            neighbor_eval = evaluate_solution(neighbor, inp)
 
-    return current_solution, current_eval
+            return neighbor, neighbor_eval
+
+    return filter_solution(current_solution), evaluate_solution(filter_solution(current_solution), inp)
+
+
+def route_cost(route: Route, inp: Input) -> int:
+    if len(route) == 0:
+        return 0
+
+    cost = inp.C[0, route[0]]
+
+    for i in range(len(route) - 1):
+        cost += inp.C[route[i], route[i + 1]]
+
+    cost += inp.C[route[-1], 0]
+    return cost
+
+def generate_greedy_start_solution(inp: Input, rng: random.Random) -> Solution:
+    customers = list(range(1, inp.N + 1))
+
+    # Serve tight-deadline customers first.
+    customers.sort(key=lambda c: (inp.T_out[c], inp.T_in[c]))
+
+    solution: Solution = []
+
+    for customer in customers:
+        best_route_idx = None
+        best_insert_pos = None
+        best_delta = None
+
+        # Try inserting the customer into every route and every position.
+        for route_idx, route in enumerate(solution):
+            old_cost = route_cost(route, inp)
+
+            for insert_pos in range(len(route) + 1):
+                candidate_route = route.copy()
+                candidate_route.insert(insert_pos, customer)
+
+                candidate_eval = evaluate_route(candidate_route, inp, stop_on_infeasible=True)
+
+                if not candidate_eval.feasible:
+                    continue
+
+                delta = candidate_eval.travel_cost - old_cost
+
+                if best_delta is None or delta < best_delta:
+                    best_delta = delta
+                    best_route_idx = route_idx
+                    best_insert_pos = insert_pos
+
+        if best_route_idx is None:
+            # Customer could not be inserted into any existing route.
+            # Start a new van route.
+            solution.append([customer])
+        else:
+            solution[best_route_idx].insert(best_insert_pos, customer)
+
+    return solution
+
+def generate_greedy_randomized_start_solution(inp: Input, rng: random.Random) -> Solution:
+    customers = list(range(1, inp.N + 1))
+
+    # Mostly deadline-based, but with slight randomization.
+    customers.sort(key=lambda c: (inp.T_out[c], inp.T_in[c]))
+
+    # Shuffle small blocks so restarts are not identical.
+    block_size = 20
+    randomized_customers = []
+
+    for i in range(0, len(customers), block_size):
+        block = customers[i:i + block_size]
+        rng.shuffle(block)
+        randomized_customers.extend(block)
+
+    solution: Solution = []
+
+    for customer in randomized_customers:
+        best_route_idx = None
+        best_insert_pos = None
+        best_delta = None
+
+        for route_idx, route in enumerate(solution):
+            old_cost = route_cost(route, inp)
+
+            for insert_pos in range(len(route) + 1):
+                candidate_route = route.copy()
+                candidate_route.insert(insert_pos, customer)
+
+                candidate_eval = evaluate_route(candidate_route, inp, stop_on_infeasible=True)
+
+                if not candidate_eval.feasible:
+                    continue
+
+                delta = candidate_eval.travel_cost - old_cost
+
+                # Small noise helps diversify restarts.
+                noisy_delta = delta + rng.random() * 0.01
+
+                if best_delta is None or noisy_delta < best_delta:
+                    best_delta = noisy_delta
+                    best_route_idx = route_idx
+                    best_insert_pos = insert_pos
+
+        if best_route_idx is None:
+            solution.append([customer])
+        else:
+            solution[best_route_idx].insert(best_insert_pos, customer)
+
+    return solution
 
 def hill_climbing(solution: Solution, inp: Input, rng: random.Random, end_time: float):
     current_solution = filter_solution(copy_solution(solution))
@@ -355,20 +492,23 @@ def hill_climbing(solution: Solution, inp: Input, rng: random.Random, end_time: 
 
     return current_solution, current_eval
 
-def generate_random_start_solution(inp: Input, rng: random.Random) -> Solution:
-    customers = list(range(1, inp.N + 1))
-    rng.shuffle(customers)
-    return [[customer] for customer in customers]
-
 def restart_hill_climbing(solution: Solution, inp: Input, rng: random.Random, end_time: float):
     best_solution = filter_solution(copy_solution(solution))
     best_eval = evaluate_solution(best_solution, inp)
 
+    # First improve the greedy solution.
+    current_solution, current_eval = hill_climbing(best_solution, inp, rng, end_time)
+
+    if current_eval.objective < best_eval.objective:
+        best_solution = current_solution
+        best_eval = current_eval
+
+    # Then use randomized restarts if there is still time.
     while True:
         if time.time() >= end_time:
             break
 
-        start_solution = generate_random_start_solution(inp, rng)
+        start_solution = generate_greedy_randomized_start_solution(inp, rng)
         current_solution, current_eval = hill_climbing(start_solution, inp, rng, end_time)
 
         if current_eval.objective < best_eval.objective:
@@ -403,7 +543,6 @@ def write_solution(filename: str, solution: Solution, inp: Input) -> None:
                 f.write(f" {customer} {arrival_time}")
             f.write("\n")
 
-
 def main():
     if len(sys.argv) != 4:
         print("Usage: ./your-solver PATH_INPUT_FILE PATH_OUTPUT_FILE TIME_LIMIT_SECONDS")
@@ -431,9 +570,9 @@ def main():
     # solution = [route for route in solution if len(route) > 0] # Remove empty routes (if any)
     # solution_eval = evaluate_solution(solution, inp)
 
-    solution = [[customer] for customer in range(1, inp.N + 1)]
+    solution = generate_greedy_start_solution(inp, rng)
 
-    time_reserved_for_writing = 0.05 # seconds # TODO
+    time_reserved_for_writing = 0.35 # seconds # TODO
     solution, solution_eval = restart_hill_climbing(solution, inp, rng, end_time-time_reserved_for_writing) # Leave some time for writing the solution
 
 
